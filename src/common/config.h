@@ -10,32 +10,24 @@
 #ifndef CONFIG_H_
 #define CONFIG_H_
 
-#include <emmintrin.h>
-#include <immintrin.h>
-#include <unistd.h>
-
-#include <boost/range/algorithm/count.hpp>
-#include <fstream>  // std::ifstream
-#include <iostream>
+#include <atomic>
+#include <cstddef>
+#include <string>
 #include <vector>
 
-#include "buffer.h"
-#include "comms-lib.h"
+#include "common_typedef_sdk.h"
 #include "framestats.h"
-#include "gettime.h"
 #include "ldpc_config.h"
 #include "memory_manage.h"
-#include "modulation.h"
 #include "nlohmann/json.hpp"
 #include "symbols.h"
 #include "utils.h"
-#include "utils_ldpc.h"
 
 class Config {
  public:
   static constexpr bool kDebugRecipCal = false;
   // Constructor
-  explicit Config(const std::string& /*jsonfile*/);
+  explicit Config(std::string jsonfilename);
   ~Config();
 
   inline void Running(bool value) { this->running_.store(value); }
@@ -87,6 +79,18 @@ class Config {
   inline double ClientRxGainB(size_t id) const {
     return this->client_rx_gain_b_.at(id);
   }
+  inline const std::vector<double>& ClientTxGainA() const {
+    return this->client_tx_gain_a_;
+  }
+  inline const std::vector<double>& ClientRxGainA() const {
+    return this->client_rx_gain_a_;
+  }
+  inline const std::vector<double>& ClientTxGainB() const {
+    return this->client_tx_gain_b_;
+  }
+  inline const std::vector<double>& ClientRxGainB() const {
+    return this->client_rx_gain_b_;
+  }
   inline size_t NumCells() const { return this->num_cells_; }
   inline size_t NumRadios() const { return this->num_radios_; }
   inline size_t InitCalibRepeat() const { return this->init_calib_repeat_; }
@@ -98,10 +102,11 @@ class Config {
   inline size_t BeaconAnt() const { return this->beacon_ant_; }
   inline size_t BeaconLen() const { return this->beacon_len_; }
 
-  inline bool DynamicCoreAlloc() const { return this->dynamic_core_allocation_; }
   inline bool Beamsweep() const { return this->beamsweep_; }
   inline bool SampleCalEn() const { return this->sample_cal_en_; }
   inline bool ImbalanceCalEn() const { return this->imbalance_cal_en_; }
+  inline size_t BeamformingAlgo() const { return this->beamforming_algo_; }
+  inline std::string Beamforming() const { return this->beamforming_str_; }
   inline bool ExternalRefNode(size_t id) const {
     return this->external_ref_node_.at(id);
   }
@@ -172,7 +177,6 @@ class Config {
     }
   }
 
-  inline std::vector<size_t> ExcludedCores() const { return this->excluded; }
   inline size_t CoreOffset() const { return this->core_offset_; }
   inline size_t WorkerThreadNum() const { return this->worker_thread_num_; }
   inline size_t SocketThreadNum() const { return this->socket_thread_num_; }
@@ -187,16 +191,16 @@ class Config {
   inline size_t FftThreadNum() const { return this->fft_thread_num_; }
   inline size_t DemulThreadNum() const { return this->demul_thread_num_; }
   inline size_t DecodeThreadNum() const { return this->decode_thread_num_; }
-  inline size_t ZfThreadNum() const { return this->zf_thread_num_; }
+  inline size_t BeamThreadNum() const { return this->beam_thread_num_; }
   inline size_t DemulBlockSize() const { return this->demul_block_size_; }
 
   inline size_t DemulEventsPerSymbol() const {
     return this->demul_events_per_symbol_;
   }
-  inline size_t ZfBlockSize() const { return this->zf_block_size_; }
-  inline size_t ZfBatchSize() const { return this->zf_batch_size_; }
-  inline size_t ZfEventsPerSymbol() const {
-    return this->zf_events_per_symbol_;
+  inline size_t BeamBlockSize() const { return this->beam_block_size_; }
+  inline size_t BeamBatchSize() const { return this->beam_batch_size_; }
+  inline size_t BeamEventsPerSymbol() const {
+    return this->beam_events_per_symbol_;
   }
   inline size_t FftBlockSize() const { return this->fft_block_size_; }
 
@@ -277,7 +281,7 @@ class Config {
     return dir == Direction::kUplink ? this->ul_mod_table_
                                      : this->dl_mod_table_;
   }
-  inline nlohmann::json MCSParams(Direction dir) {
+  inline const nlohmann::json& MCSParams(Direction dir) const {
     return dir == Direction::kUplink ? this->ul_mcs_params_
                                      : this->dl_mcs_params_;
   }
@@ -313,10 +317,6 @@ class Config {
   inline size_t UeMacRxPort() const { return this->ue_mac_rx_port_; }
   inline size_t UeMacTxPort() const { return this->ue_mac_tx_port_; }
 
-  inline std::string RpRemoteHostName() const { return this->rp_remote_host_name_; }
-  inline size_t RpRxPort() const { return this->rp_rx_port_; }
-  inline size_t RpTxPort() const { return this->rp_tx_port_; }
-
   /* Inline accessors (complex types) */
   inline const std::vector<int>& ClTxAdvance() const {
     return this->cl_tx_advance_;
@@ -346,6 +346,9 @@ class Config {
   };
   inline const std::vector<std::string>& UeRadioId() const {
     return this->ue_radio_id_;
+  };
+  inline const std::vector<std::string>& UeRadioName() const {
+    return this->ue_radio_name_;
   };
   inline const std::vector<size_t>& CellId() const { return this->cell_id_; }
 
@@ -418,17 +421,17 @@ class Config {
 
   /// Fetch the data buffer for this frame and symbol ID. The symbol must
   /// be an uplink symbol.
-  inline complex_float* GetDataBuf(Table<complex_float>& data_buffers,
-                                   size_t frame_id, size_t symbol_id) const {
+  inline size_t GetIndexForFrameAndSymbol(size_t frame_id,
+                                          size_t symbol_id) const {
     size_t frame_slot = frame_id % kFrameWnd;
     size_t symbol_offset = (frame_slot * this->frame_.NumULSyms()) +
                            this->frame_.GetULSymbolIdx(symbol_id);
-    return data_buffers[symbol_offset];
+    return symbol_offset;
   }
 
   /// Return the subcarrier ID to which we should refer to for the zeroforcing
   /// matrices of subcarrier [sc_id].
-  inline size_t GetZfScId(size_t sc_id) const {
+  inline size_t GetBeamScId(size_t sc_id) const {
     return this->freq_orthogonal_pilot_ ? sc_id - (sc_id % ue_num_) : sc_id;
   }
 
@@ -460,6 +463,24 @@ class Config {
                              cb_id * num_bytes_per_cb];
   }
 
+  inline size_t GetMacBitsIdx(Direction dir, size_t frame_id, size_t symbol_id,
+                              size_t cb_id) const {
+    size_t mac_bytes_perframe;
+    size_t num_bytes_per_cb;
+    size_t mac_packet_length;
+    if (dir == Direction::kDownlink) {
+      mac_bytes_perframe = this->dl_mac_bytes_num_perframe_;
+      num_bytes_per_cb = this->dl_num_bytes_per_cb_;
+      mac_packet_length = this->dl_mac_packet_length_;
+    } else {
+      mac_bytes_perframe = ul_mac_bytes_num_perframe_;
+      num_bytes_per_cb = this->ul_num_bytes_per_cb_;
+      mac_packet_length = this->ul_mac_packet_length_;
+    }
+    return (frame_id % kFrameWnd) * mac_bytes_perframe +
+           symbol_id * mac_packet_length + cb_id * num_bytes_per_cb;
+  }
+
   /// Get info bits for this symbol, user and code block ID
   inline int8_t* GetInfoBits(Table<int8_t>& info_bits, Direction dir,
                              size_t symbol_id, size_t ue_id,
@@ -475,6 +496,21 @@ class Config {
     }
     return &info_bits[symbol_id][Roundup<64>(num_bytes_per_cb) *
                                  (num_blocks_in_symbol * ue_id + cb_id)];
+  }
+
+  inline size_t GetInfoBitsIdx(Direction dir, size_t ue_id,
+                               size_t cb_id) const {
+    size_t num_bytes_per_cb;
+    size_t num_blocks_in_symbol;
+    if (dir == Direction::kDownlink) {
+      num_bytes_per_cb = this->dl_num_bytes_per_cb_;
+      num_blocks_in_symbol = this->dl_ldpc_config_.NumBlocksInSymbol();
+    } else {
+      num_bytes_per_cb = this->ul_num_bytes_per_cb_;
+      num_blocks_in_symbol = this->ul_ldpc_config_.NumBlocksInSymbol();
+    }
+    return Roundup<64>(num_bytes_per_cb) *
+           (num_blocks_in_symbol * ue_id + cb_id);
   }
 
   /// Get encoded_buffer for this frame, symbol, user and code block ID
@@ -495,6 +531,19 @@ class Config {
                            [Roundup<64>(ofdm_data_num) * ue_id + sc_id];
   }
 
+  /// Get encoded_buffer for this frame, symbol, user and code block ID
+  inline size_t GetModBitsBufIdx(Direction dir, size_t ue_id,
+                                 size_t sc_id) const {
+    size_t ofdm_data_num;
+    if (dir == Direction::kDownlink) {
+      ofdm_data_num = GetOFDMDataNum();
+    } else {
+      ofdm_data_num = this->ofdm_data_num_;
+    }
+
+    return Roundup<64>(ofdm_data_num) * ue_id + sc_id;
+  }
+
   // Returns the number of pilot subcarriers in downlink symbols used for
   // phase tracking
   inline size_t GetOFDMPilotNum() const {
@@ -512,6 +561,8 @@ class Config {
   inline bool IsDataSubcarrier(size_t sc_id) const {
     return symbol_map_.at(sc_id) == SubcarrierType::kData;
   }
+  inline const std::string& ConfigFilename() const { return config_filename_; }
+  inline const std::string& TraceFilename() const { return trace_file_; }
 
  private:
   void Print() const;
@@ -631,6 +682,7 @@ class Config {
   std::vector<std::string> radio_id_;
   std::vector<std::string> hub_id_;
   std::vector<std::string> ue_radio_id_;
+  std::vector<std::string> ue_radio_name_;
   std::vector<size_t> ref_radio_;
   std::vector<size_t> ref_ant_;
   std::vector<size_t> cell_id_;
@@ -666,22 +718,22 @@ class Config {
   size_t beacon_ant_;
   size_t beacon_len_;
   size_t init_calib_repeat_;
-  bool dynamic_core_allocation_;
   bool beamsweep_;
   bool sample_cal_en_;
   bool imbalance_cal_en_;
+  size_t beamforming_algo_;
+  std::string beamforming_str_;
   std::vector<bool> external_ref_node_;
   std::string channel_;
   std::string ue_channel_;
 
-  std::vector<size_t> excluded;
   size_t core_offset_;
   size_t worker_thread_num_;
   size_t socket_thread_num_;
   size_t fft_thread_num_;
   size_t demul_thread_num_;
   size_t decode_thread_num_;
-  size_t zf_thread_num_;
+  size_t beam_thread_num_;
 
   size_t ue_core_offset_;
   size_t ue_worker_thread_num_;
@@ -692,11 +744,11 @@ class Config {
   size_t demul_events_per_symbol_;  // Derived from demul_block_size
 
   // Number of OFDM data subcarriers handled in one doZF function call
-  size_t zf_block_size_;
+  size_t beam_block_size_;
 
   // Number of doZF function call handled in on event
-  size_t zf_batch_size_;
-  size_t zf_events_per_symbol_;  // Derived from zf_block_size
+  size_t beam_batch_size_;
+  size_t beam_events_per_symbol_;  // Derived from beam_block_size
 
   // Number of antennas handled in one FFT event
   size_t fft_block_size_;
@@ -823,11 +875,6 @@ class Config {
   size_t ue_mac_rx_port_;
   size_t ue_mac_tx_port_;
 
-  // Port ID at RP
-  std::string rp_remote_host_name_;
-  size_t rp_rx_port_;
-  size_t rp_tx_port_;
-
   // Number of frames_ sent by sender during testing = number of frames_
   // processed by Agora before exiting.
   size_t frames_to_test_;
@@ -842,5 +889,7 @@ class Config {
   size_t dl_num_bytes_per_cb_;
 
   bool fft_in_rru_;  // If true, the RRU does FFT instead of Agora
+  const std::string config_filename_;
+  std::string trace_file_;
 };
 #endif /* CONFIG_HPP_ */

@@ -2,10 +2,12 @@
 // For some reason, gtest include order matters
 #include <thread>
 
+#include "buffer.h"
 #include "concurrentqueue.h"
 #include "config.h"
-#include "dozf.h"
+#include "dobeamweights.h"
 #include "gettime.h"
+#include "message.h"
 #include "utils.h"
 
 static constexpr size_t kNumWorkers = 14;
@@ -30,10 +32,11 @@ void MasterToWorkerDynamicMaster(
     cfg->BsAntNum(kBsAntNums[bs_ant_idx]);
     for (size_t i = 0; i < kMaxTestNum; i++) {
       uint32_t frame_id =
-          i / cfg->ZfEventsPerSymbol() + kFrameOffsets[bs_ant_idx];
-      size_t base_sc_id = (i % cfg->ZfEventsPerSymbol()) * cfg->ZfBlockSize();
+          i / cfg->BeamEventsPerSymbol() + kFrameOffsets[bs_ant_idx];
+      size_t base_sc_id =
+          (i % cfg->BeamEventsPerSymbol()) * cfg->BeamBlockSize();
       event_queue.enqueue(EventData(
-          EventType::kZF, gen_tag_t::FrmSc(frame_id, base_sc_id).tag_));
+          EventType::kBeam, gen_tag_t::FrmSc(frame_id, base_sc_id).tag_));
     }
 
     // Dequeue all events in queue to avoid overflow
@@ -52,15 +55,8 @@ void MasterToWorkerDynamicWorker(
     Config* cfg, size_t worker_id,
     moodycamel::ConcurrentQueue<EventData>& event_queue,
     moodycamel::ConcurrentQueue<EventData>& complete_task_queue,
-    moodycamel::ProducerToken* ptok,
-    PtrGrid<kFrameWnd, kMaxUEs, complex_float>& csi_buffers,
-    Table<complex_float>& calib_dl_msum_buffer,
-    Table<complex_float>& calib_ul_msum_buffer,
-    Table<complex_float>& calib_dl_buffer,
-    Table<complex_float>& calib_ul_buffer,
-    PtrGrid<kFrameWnd, kMaxDataSCs, complex_float>& ul_zf_matrices,
-    PtrGrid<kFrameWnd, kMaxDataSCs, complex_float>& dl_zf_matrices,
-    PhyStats* phy_stats, Stats* stats) {
+    moodycamel::ProducerToken* ptok, AgoraBuffer* buffer, PhyStats* phy_stats,
+    Stats* stats) {
   PinToCoreWithOffset(ThreadType::kWorker, cfg->CoreOffset() + 1, worker_id);
 
   // Wait for all threads (including master) to start runnung
@@ -69,16 +65,14 @@ void MasterToWorkerDynamicWorker(
     // Wait
   }
 
-  auto compute_zf = std::make_unique<DoZF>(
-      cfg, worker_id, csi_buffers, calib_dl_msum_buffer, calib_ul_msum_buffer,
-      calib_dl_buffer, calib_ul_buffer, ul_zf_matrices, dl_zf_matrices,
-      phy_stats, stats);
+  auto compute_beam =
+      std::make_unique<DoBeamWeights>(cfg, worker_id, buffer, phy_stats, stats);
 
   size_t start_tsc = GetTime::Rdtsc();
   size_t num_tasks = 0;
   EventData req_event;
   size_t max_frame_id_wo_offset =
-      (kMaxTestNum - 1) / (cfg->OfdmDataNum() / cfg->ZfBlockSize());
+      (kMaxTestNum - 1) / (cfg->OfdmDataNum() / cfg->BeamBlockSize());
   for (size_t i = 0; i < kMaxItrNum; i++) {
     if (event_queue.try_dequeue(req_event)) {
       num_tasks++;
@@ -92,7 +86,7 @@ void MasterToWorkerDynamicWorker(
         frame_offset_id = 2;
       }
       ASSERT_EQ(cfg->BsAntNum(), kBsAntNums[frame_offset_id]);
-      EventData resp_event = compute_zf->Launch(req_event.tags_[0]);
+      EventData resp_event = compute_beam->Launch(req_event.tags_[0]);
       TryEnqueueFallback(&complete_task_queue, ptok, resp_event);
     }
   }
@@ -106,7 +100,7 @@ void MasterToWorkerDynamicWorker(
 /// when BsAntNum() varies in runtime
 TEST(TestZF, VaryingConfig) {
   static constexpr size_t kNumIters = 10000;
-  auto cfg = std::make_unique<Config>("data/tddconfig-sim-ul.json");
+  auto cfg = std::make_unique<Config>("files/config/ci/tddconfig-sim-ul.json");
   cfg->GenData();
 
   auto event_queue = moodycamel::ConcurrentQueue<EventData>(2 * kNumIters);
@@ -117,25 +111,7 @@ TEST(TestZF, VaryingConfig) {
     ptok = new moodycamel::ProducerToken(complete_task_queue);
   }
 
-  Table<complex_float> calib_dl_msum_buffer;
-  Table<complex_float> calib_ul_msum_buffer;
-
-  Table<complex_float> calib_dl_buffer;
-  Table<complex_float> calib_ul_buffer;
-
-  PtrGrid<kFrameWnd, kMaxUEs, complex_float> csi_buffers;
-  csi_buffers.RandAllocCxFloat(kMaxAntennas * kMaxDataSCs);
-
-  PtrGrid<kFrameWnd, kMaxDataSCs, complex_float> ul_zf_matrices(kMaxAntennas *
-                                                                kMaxUEs);
-  PtrGrid<kFrameWnd, kMaxDataSCs, complex_float> dl_zf_matrices(kMaxUEs *
-                                                                kMaxAntennas);
-
-  calib_dl_buffer.RandAllocCxFloat(kFrameWnd, kMaxDataSCs * kMaxAntennas,
-                                   Agora_memory::Alignment_t::kAlign64);
-  calib_ul_buffer.RandAllocCxFloat(kFrameWnd, kMaxDataSCs * kMaxAntennas,
-                                   Agora_memory::Alignment_t::kAlign64);
-
+  auto buffer = std::make_unique<AgoraBuffer>(cfg.get());
   auto phy_stats = std::make_unique<PhyStats>(cfg.get(), Direction::kUplink);
   auto stats = std::make_unique<Stats>(cfg.get());
 
@@ -144,22 +120,14 @@ TEST(TestZF, VaryingConfig) {
                        std::ref(event_queue), std::ref(complete_task_queue));
 
   for (size_t i = 0; i < kNumWorkers; i++) {
-    threads.emplace_back(
-        MasterToWorkerDynamicWorker, cfg.get(), i, std::ref(event_queue),
-        std::ref(complete_task_queue), ptoks[i], std::ref(csi_buffers),
-        std::ref(calib_dl_msum_buffer), std::ref(calib_ul_msum_buffer),
-        std::ref(calib_dl_buffer), std::ref(calib_ul_buffer),
-        std::ref(ul_zf_matrices), std::ref(dl_zf_matrices), phy_stats.get(),
-        stats.get());
+    threads.emplace_back(MasterToWorkerDynamicWorker, cfg.get(), i,
+                         std::ref(event_queue), std::ref(complete_task_queue),
+                         ptoks[i], buffer.get(), phy_stats.get(), stats.get());
   }
   for (auto& thread : threads) {
     thread.join();
   }
 
-  calib_dl_msum_buffer.Free();
-  calib_ul_msum_buffer.Free();
-  calib_dl_buffer.Free();
-  calib_ul_buffer.Free();
   for (auto& ptok : ptoks) {
     delete ptok;
   }

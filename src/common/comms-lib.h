@@ -12,18 +12,19 @@
 #ifndef COMMSLIB_H_
 #define COMMSLIB_H_
 
-#include <immintrin.h>
-#include <unistd.h>
-
-#include <algorithm>
+#include <cmath>
 #include <complex>
-#include <fstream>
-#include <iostream>
+#include <map>
+#include <string>
 #include <vector>
 
-#include "buffer.h"
+#include "common_typedef_sdk.h"
+#include "immintrin.h"
 #include "memory_manage.h"
 #include "mkl_dfti.h"
+
+static const std::map<std::string, size_t> kBeamformingStr{
+    {"ZF", 0}, {"MMSE", 1}, {"MRC", 2}};
 
 class CommsLib {
  public:
@@ -44,6 +45,8 @@ class CommsLib {
     kQaM256 = 8
   };
 
+  enum BeamformingAlgorithm { kZF = 0, kMMSE = 1, kMRC = 2 };
+
   explicit CommsLib(std::string);
   ~CommsLib();
 
@@ -60,7 +63,13 @@ class CommsLib {
   static MKL_LONG FFT(complex_float* in_out, int fftsize);
   static MKL_LONG IFFT(complex_float* in_out, int fftsize,
                        bool normalize = true);
-  static float ComputeOfdmSnr(const std::vector<std::complex<float>>& in,
+  static std::vector<std::complex<float>> FFTShift(
+      const std::vector<std::complex<float>>& in);
+  static std::vector<complex_float> FFTShift(
+      const std::vector<complex_float>& in);
+  static void FFTShift(complex_float* in, complex_float* tmp, int fftsize);
+
+  static float ComputeOfdmSnr(const std::vector<std::complex<float>>& data_t,
                               size_t data_start_index, size_t data_stop_index);
   static size_t FindPilotSeq(const std::vector<std::complex<float>>& iq,
                              const std::vector<std::complex<float>>& pilot,
@@ -83,9 +92,6 @@ class CommsLib {
       std::vector<float> const& win, size_t fftSize);
   static std::vector<float> HannWindowFunction(size_t fftSize);
   static double WindowFunctionPower(std::vector<float> const& win);
-  // template <typename T>
-  // static T findTone(std::vector<T> const&, double, double, size_t, const
-  // size_t delta = 10);
   static float FindTone(std::vector<float> const& magnitude, double winGain,
                         double fftBin, size_t fftSize, const size_t delta = 10);
   static float MeasureTone(std::vector<std::complex<float>> const& samps,
@@ -108,6 +114,12 @@ class CommsLib {
   }
   static int FindBeaconAvx(const std::vector<std::complex<float>>& iq,
                            const std::vector<std::complex<float>>& seq);
+
+  ///Find Beacon with raw samples from the radio
+  static ssize_t FindBeaconAvx(const std::complex<int16_t>* iq,
+                               const std::vector<std::complex<float>>& seq,
+                               size_t sample_window);
+
   static std::vector<float> CorrelateAvxS(std::vector<float> const& f,
                                           std::vector<float> const& g);
   static std::vector<float> Abs2Avx(std::vector<std::complex<float>> const& f);

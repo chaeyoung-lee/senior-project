@@ -5,10 +5,11 @@
  */
 #ifndef MEMORY_MANAGE_H_
 #define MEMORY_MANAGE_H_
+
 #include <array>
 #include <cassert>
 #include <complex>
-#include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -95,6 +96,9 @@ class Table {
     assert(this->dim1_ > dim1);
     return (this->data_ + (dim1 * this->dim2_));
   }
+
+  size_t Dim1() { return (this->dim1_); }
+  size_t Dim2() { return (this->dim2_); }
 };
 
 template <typename T, typename U>

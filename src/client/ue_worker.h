@@ -10,19 +10,17 @@
 #include <thread>
 #include <vector>
 
-#include "buffer.h"
+#include "common_typedef_sdk.h"
 #include "concurrentqueue.h"
 #include "config.h"
 #include "csv_logger.h"
 #include "dodecode_client.h"
-#include "doencode.h"
+#include "doencode_client.h"
 #include "doifft_client.h"
+#include "message.h"
 #include "mkl_dfti.h"
+#include "simd_types.h"
 #include "stats.h"
-
-static const size_t kVectorAlignment = 64;
-using myVec = std::vector<complex_float, boost::alignment::aligned_allocator<
-                                             complex_float, kVectorAlignment>>;
 
 class UeWorker {
  public:
@@ -34,14 +32,12 @@ class UeWorker {
       moodycamel::ProducerToken& work_producer, Table<int8_t>& ul_bits_buffer,
       Table<int8_t>& encoded_buffer, Table<complex_float>& modul_buffer,
       Table<complex_float>& ifft_buffer, char* const tx_buffer,
-      Table<char>& rx_buffer, std::vector<myVec>& csi_buffer,
-      std::vector<myVec>& equal_buffer, std::vector<size_t>& non_null_sc_ind,
-      Table<complex_float>& fft_buffer,
+      Table<char>& rx_buffer, Table<complex_float>& csi_buffer,
+      std::vector<SimdAlignCxFltVector>& equal_buffer,
+      std::vector<size_t>& non_null_sc_ind, Table<complex_float>& fft_buffer,
       PtrCube<kFrameWnd, kMaxSymbols, kMaxUEs, int8_t>& demod_buffer,
       PtrCube<kFrameWnd, kMaxSymbols, kMaxUEs, int8_t>& decoded_buffer,
-      std::vector<std::vector<std::complex<float>>>& ue_pilot_vec,
-      std::shared_ptr<CsvLog::CsvLogger> logger_evmsnr,
-      std::shared_ptr<CsvLog::CsvLogger> logger_berser);
+      std::vector<std::vector<std::complex<float>>>& ue_pilot_vec);
   ~UeWorker();
 
   void Start(size_t core_offset);
@@ -54,7 +50,7 @@ class UeWorker {
    * modulate data from nUEs and does spatial multiplexing by applying
    * beamweights
    */
-  void DoEncodeUe(DoEncode* encoder, size_t tag);
+  void DoEncodeUe(DoEncodeClient* encoder, size_t tag);
   void DoModul(size_t tag);
   void DoIfftUe(DoIFFTClient* iffter, size_t tag);
   void DoIfft(size_t tag);
@@ -148,16 +144,13 @@ class UeWorker {
 
   // Downlink
   Table<char>& rx_buffer_;
-  std::vector<myVec>& csi_buffer_;
-  std::vector<myVec>& equal_buffer_;
+  Table<complex_float>& csi_buffer_;
+  std::vector<SimdAlignCxFltVector>& equal_buffer_;
   std::vector<size_t>& non_null_sc_ind_;
   Table<complex_float>& fft_buffer_;
   PtrCube<kFrameWnd, kMaxSymbols, kMaxUEs, int8_t>& demod_buffer_;
   PtrCube<kFrameWnd, kMaxSymbols, kMaxUEs, int8_t>& decoded_buffer_;
 
   std::vector<std::vector<std::complex<float>>>& ue_pilot_vec_;
-
-  std::shared_ptr<CsvLog::CsvLogger> logger_evmsnr_;
-  std::shared_ptr<CsvLog::CsvLogger> logger_berser_;
 };
 #endif  // UE_WORKER_H_

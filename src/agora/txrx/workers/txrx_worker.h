@@ -13,6 +13,7 @@
 
 #include "concurrentqueue.h"
 #include "config.h"
+#include "message.h"
 
 class TxRxWorker {
  public:
@@ -28,6 +29,7 @@ class TxRxWorker {
              std::vector<RxPacket>& rx_memory, std::byte* const tx_memory,
              std::mutex& sync_mutex, std::condition_variable& sync_cond,
              std::atomic<bool>& can_proceed);
+  TxRxWorker() = delete;
 
   virtual ~TxRxWorker();
 
@@ -63,7 +65,6 @@ class TxRxWorker {
   std::atomic<bool>& can_proceed_;
 
  private:
-  TxRxWorker() = delete;
   Config* const cfg_;
   std::thread thread_;
 

@@ -9,7 +9,7 @@
 #include <memory>
 #include <vector>
 
-#include "buffer.h"
+#include "message.h"
 #include "txrx_worker.h"
 #include "udp_client.h"
 #include "udp_server.h"
@@ -26,12 +26,12 @@ class TxRxWorkerSim : public TxRxWorker {
                 std::vector<RxPacket>& rx_memory, std::byte* const tx_memory,
                 std::mutex& sync_mutex, std::condition_variable& sync_cond,
                 std::atomic<bool>& can_proceed);
+  TxRxWorkerSim() = delete;
   ~TxRxWorkerSim() final;
 
   void DoTxRx() final;
 
  private:
-  TxRxWorkerSim() = delete;
   size_t DequeueSend();
   void SendBeacon(size_t frame_id);
   std::vector<Packet*> RecvEnqueue(size_t interface_id);

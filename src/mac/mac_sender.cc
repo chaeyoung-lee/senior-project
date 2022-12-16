@@ -9,7 +9,9 @@
 
 #include "datatype_conversion.h"
 #include "file_receiver.h"
+#include "gettime.h"
 #include "logger.h"
+#include "message.h"
 #include "udp_client.h"
 #include "video_receiver.h"
 
@@ -546,8 +548,8 @@ void MacSender::UpdateTxBuffer(MacDataReceiver* data_source, gen_tag_t tag) {
 
 void MacSender::WriteStatsToFile(size_t tx_frame_count) const {
   std::string cur_directory = TOSTRING(PROJECT_DIRECTORY);
-  std::string filename = cur_directory + "/data/tx_result.txt";
-  AGORA_LOG_INFO("Printing sender results to file \"%s\"...\n",
+  std::string filename = cur_directory + "/files/experiment/max_tx_result.txt";
+  AGORA_LOG_INFO("Printing mac sender results to file \"%s\"...\n",
                  filename.c_str());
 
   std::ofstream debug_file;

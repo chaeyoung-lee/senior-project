@@ -25,7 +25,7 @@ static constexpr size_t kFrameWnd = 40;
 #if __INTEL_MKL__ >= 2020 || (__INTEL_MKL__ == 2019 && __INTEL_MKL_UPDATE__ > 3)
 #define USE_MKL_JIT (1)
 #else
-#define USE_MKL_JIT (0)
+#undef USE_MKL_JIT
 #endif
 
 #define ENABLE_RB_IND (0)
@@ -38,11 +38,11 @@ static constexpr inline bool IsPowerOfTwo(T x) {
 
 enum class Direction : int { kDownlink, kUplink };
 
-// TODO: Merge EventType and DoerType into WorkType
+/// \todo Merge EventType and DoerType into WorkType
 enum class EventType : int {
   kPacketRX,
   kFFT,
-  kZF,
+  kBeam,
   kDemul,
   kIFFT,
   kPrecode,
@@ -53,22 +53,21 @@ enum class EventType : int {
   kModul,
   kPacketFromMac,
   kPacketToMac,
-  kPacketFromRp,
-  kPacketToRp,
   kFFTPilot,
-  kSNRReport,   // Signal new SNR measurement from PHY to MAC
-  kRANUpdate,   // Signal new RAN config to Agora
-  kRBIndicator  // Signal RB schedule to UEs
+  kSNRReport,    // Signal new SNR measurement from PHY to MAC
+  kRANUpdate,    // Signal new RAN config to Agora
+  kRBIndicator,  // Signal RB schedule to UEs
+  kThreadTermination
 };
 
 static constexpr size_t kNumEventTypes =
-    static_cast<size_t>(EventType::kPacketToMac) + 1;
+    static_cast<size_t>(EventType::kThreadTermination) + 1;
 
 // Types of Agora Doers
 enum class DoerType : size_t {
   kFFT,
   kCSI,
-  kZF,
+  kBeam,
   kDemul,
   kDecode,
   kEncode,
@@ -78,7 +77,7 @@ enum class DoerType : size_t {
 };
 
 static constexpr std::array<DoerType, (static_cast<size_t>(DoerType::kRC) + 1)>
-    kAllDoerTypes = {DoerType::kFFT,   DoerType::kCSI,     DoerType::kZF,
+    kAllDoerTypes = {DoerType::kFFT,   DoerType::kCSI,     DoerType::kBeam,
                      DoerType::kDemul, DoerType::kDecode,  DoerType::kEncode,
                      DoerType::kIFFT,  DoerType::kPrecode, DoerType::kRC};
 static constexpr size_t kNumDoerTypes = kAllDoerTypes.size();
@@ -86,7 +85,7 @@ static constexpr size_t kNumDoerTypes = kAllDoerTypes.size();
 static const std::map<DoerType, std::string> kDoerNames = {
     {DoerType::kFFT, std::string("FFT")},
     {DoerType::kCSI, std::string("CSI")},
-    {DoerType::kZF, std::string("ZF")},
+    {DoerType::kBeam, std::string("Beamweights")},
     {DoerType::kDemul, std::string("Demul")},
     {DoerType::kDecode, std::string("Decode")},
     {DoerType::kEncode, std::string("Encode")},
@@ -100,7 +99,7 @@ enum class PrintType : int {
   kFFTPilots,
   kFFTData,
   kFFTCal,
-  kZF,
+  kBeam,
   kDemul,
   kIFFT,
   kPrecode,
@@ -113,6 +112,24 @@ enum class PrintType : int {
   kPacketToMac,
   kModul
 };
+
+enum ScheduleProcessingFlags : uint8_t {
+  kNone = 0,
+  kUplinkComplete = 0x1,
+  kDownlinkComplete = 0x2,
+  kProcessingComplete = (kUplinkComplete + kDownlinkComplete)
+};
+
+// Moved from Agora class
+/// \todo need organization
+static const size_t kDefaultMessageQueueSize = 512;
+static const size_t kDefaultWorkerQueueSize = 256;
+// Max number of worker threads allowed
+static const size_t kMaxWorkerNum = 50;
+static const size_t kScheduleQueues = 2;
+// Dequeue batch size, used to reduce the overhead of dequeue in main thread
+static const size_t kDequeueBulkSizeTXRX = 8;
+static const size_t kDequeueBulkSizeWorker = 4;
 
 // Enable thread pinning and exit if thread pinning fails. Thread pinning is
 // crucial for good performance. For testing or developing Agora on machines
@@ -172,7 +189,7 @@ static constexpr bool kUplinkHardDemod = false;
 static constexpr bool kExportConstellation = false;
 static constexpr bool kPrintPhyStats = true;
 static constexpr bool kCollectPhyStats = true;
-static constexpr bool kPrintZfStats = true;
+static constexpr bool kPrintBeamStats = true;
 
 static constexpr bool kStatsPrintFrameSummary = true;
 static constexpr bool kDebugPrintPerFrameDone = true;
@@ -196,16 +213,16 @@ enum class ThreadType {
   kMaster,
   kWorker,
   kWorkerFFT,
-  kWorkerZF,
+  kWorkerBeam,
   kWorkerDemul,
   kWorkerDecode,
   kWorkerRX,
   kWorkerTX,
   kWorkerTXRX,
   kWorkerMacTXRX,
-  kWorkerRpTXRX,
   kMasterRX,
   kMasterTX,
+  kRecorderWorker
 };
 
 static inline std::string ThreadTypeStr(ThreadType thread_type) {
@@ -216,8 +233,8 @@ static inline std::string ThreadTypeStr(ThreadType thread_type) {
       return "Worker";
     case ThreadType::kWorkerFFT:
       return "Worker (FFT)";
-    case ThreadType::kWorkerZF:
-      return "Worker (ZF)";
+    case ThreadType::kWorkerBeam:
+      return "Worker (Beamweights)";
     case ThreadType::kWorkerDemul:
       return "Worker (Demul)";
     case ThreadType::kWorkerDecode:
@@ -230,12 +247,12 @@ static inline std::string ThreadTypeStr(ThreadType thread_type) {
       return "TXRX";
     case ThreadType::kWorkerMacTXRX:
       return "MAC TXRX";
-    case ThreadType::kWorkerRpTXRX:
-      return "RP TXRX";
     case ThreadType::kMasterRX:
       return "Master (RX)";
     case ThreadType::kMasterTX:
       return "Master (TX)";
+    case ThreadType::kRecorderWorker:
+      return "Recorder Worker";
   }
   return "Invalid thread type";
 }
@@ -257,9 +274,6 @@ static const std::map<char, SymbolType> kSymbolMap = {
     {'U', SymbolType::kUL}};
 
 enum class SubcarrierType { kNull, kDMRS, kData };
-
-// Intervals for beacon detection at the client (in frames)
-static constexpr size_t kBeaconDetectInterval = 10;
 
 // Maximum number of symbols per frame allowed by Agora
 static constexpr size_t kMaxSymbols = 70;
@@ -318,7 +332,7 @@ static constexpr size_t kMacBaseLocalPort = 8180;
 
 // Agora sends control information over an out-of-band control channel
 // to each UE #i, at port kBaseClientPort + i
-// TODO: need to generalize for hostname, port pairs for each client
+/// \todo need to generalize for hostname, port pairs for each client
 static constexpr size_t kMacBaseClientPort = 7070;
 
 // Number of subcarriers in a partial transpose block

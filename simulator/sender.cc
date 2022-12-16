@@ -8,7 +8,9 @@
 #include <thread>
 
 #include "datatype_conversion.h"
+#include "gettime.h"
 #include "logger.h"
+#include "message.h"
 #include "udp_client.h"
 
 #if defined(USE_DPDK)
@@ -71,8 +73,9 @@ Sender::Sender(Config* cfg, size_t socket_thread_num, size_t core_offset,
   }
 
   InitIqFromFile(std::string(TOSTRING(PROJECT_DIRECTORY)) +
-                 "/data/LDPC_rx_data_" + std::to_string(cfg->OfdmCaNum()) +
-                 "_ant" + std::to_string(cfg->BsAntNum()) + ".bin");
+                 "/files/experiment/LDPC_rx_data_" +
+                 std::to_string(cfg->OfdmCaNum()) + "_ant" +
+                 std::to_string(cfg->BsAntNum()) + ".bin");
 
   task_ptok_ =
       static_cast<moodycamel::ProducerToken**>(Agora_memory::PaddedAlignedAlloc(
@@ -390,7 +393,7 @@ void* Sender::WorkerThread(int tid) {
   // We currently don't support zero-padding OFDM prefix and postfix
   RtAssert(cfg_->PacketLength() ==
            Packet::kOffsetOfData +
-               (kUse12BitIQ ? 3 : 4) * (cfg_->CpLen() + cfg_->OfdmCaNum()));
+               (kUse12BitIQ ? 3 : 4) * (cfg_->SampsPerSymbol()));
   const size_t ant_num_per_cell = cfg_->BsAntNum() / cfg_->NumCells();
 
   size_t tags[kDequeueBulkSize];
@@ -433,7 +436,7 @@ void* Sender::WorkerThread(int tid) {
         std::memcpy(
             pkt->data_,
             iq_data_short_[(pkt->symbol_id_ * cfg_->BsAntNum()) + tag.ant_id_],
-            (cfg_->CpLen() + cfg_->OfdmCaNum()) * (kUse12BitIQ ? 3 : 4));
+            (cfg_->SampsPerSymbol()) * (kUse12BitIQ ? 3 : 4));
         if (cfg_->FftInRru() == true) {
           RunFft(pkt, fft_inout, mkl_handle);
         }
@@ -521,20 +524,18 @@ uint64_t Sender::GetTicksForFrame(size_t frame_id) const {
 void Sender::InitIqFromFile(const std::string& filename) {
   const size_t packets_per_frame =
       cfg_->Frame().NumTotalSyms() * cfg_->BsAntNum();
-  iq_data_short_.Calloc(packets_per_frame,
-                        (cfg_->CpLen() + cfg_->OfdmCaNum()) * 2,
+  iq_data_short_.Calloc(packets_per_frame, (cfg_->SampsPerSymbol()) * 2,
                         Agora_memory::Alignment_t::kAlign64);
 
   Table<float> iq_data_float;
-  iq_data_float.Calloc(packets_per_frame,
-                       (cfg_->CpLen() + cfg_->OfdmCaNum()) * 2,
+  iq_data_float.Calloc(packets_per_frame, (cfg_->SampsPerSymbol()) * 2,
                        Agora_memory::Alignment_t::kAlign64);
 
   FILE* fp = std::fopen(filename.c_str(), "rb");
   RtAssert(fp != nullptr, "Failed to open IQ data file");
 
   for (size_t i = 0; i < packets_per_frame; i++) {
-    const size_t expected_count = (cfg_->CpLen() + cfg_->OfdmCaNum()) * 2;
+    const size_t expected_count = (cfg_->SampsPerSymbol()) * 2;
     const size_t actual_count =
         std::fread(iq_data_float[i], sizeof(float), expected_count, fp);
     if (expected_count != actual_count) {
@@ -551,10 +552,8 @@ void Sender::InitIqFromFile(const std::string& filename) {
                             reinterpret_cast<uint8_t*>(iq_data_short_[i]),
                             expected_count);
     } else {
-      for (size_t j = 0; j < expected_count; j++) {
-        iq_data_short_[i][j] =
-            static_cast<unsigned short>(iq_data_float[i][j] * 32768);
-      }
+      SimdConvertFloatToShort(iq_data_float[i], iq_data_short_[i],
+                              expected_count);
     }
   }
   std::fclose(fp);
@@ -568,8 +567,9 @@ void Sender::CreateWorkerThreads(size_t num_workers) {
 }
 
 void Sender::WriteStatsToFile(size_t tx_frame_count) const {
-  std::string cur_directory = TOSTRING(PROJECT_DIRECTORY);
-  std::string filename = cur_directory + "/data/tx_result.txt";
+  const std::string cur_directory = TOSTRING(PROJECT_DIRECTORY);
+  const std::string filename =
+      cur_directory + "/files/experiment/tx_result.txt";
   std::printf("Printing sender results to file \"%s\"...\n", filename.c_str());
   FILE* fp_debug = std::fopen(filename.c_str(), "w");
   RtAssert(fp_debug != nullptr, "Failed to open stats file");

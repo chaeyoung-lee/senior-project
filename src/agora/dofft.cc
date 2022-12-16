@@ -4,24 +4,20 @@
  */
 #include "dofft.h"
 
+#include "comms-lib.h"
 #include "concurrent_queue_wrapper.h"
 #include "datatype_conversion.h"
+#include "gettime.h"
+#include "logger.h"
+#include "message.h"
 
 static constexpr bool kPrintFFTInput = false;
 static constexpr bool kPrintInputPilot = false;
 static constexpr bool kPrintPilotCorrStats = false;
 
-DoFFT::DoFFT(Config* config, size_t tid, Table<complex_float>& data_buffer,
-             PtrGrid<kFrameWnd, kMaxUEs, complex_float>& csi_buffers,
-             Table<complex_float>& calib_dl_buffer,
-             Table<complex_float>& calib_ul_buffer, PhyStats* in_phy_stats,
-             Stats* stats_manager)
-    : Doer(config, tid),
-      data_buffer_(data_buffer),
-      csi_buffers_(csi_buffers),
-      calib_dl_buffer_(calib_dl_buffer),
-      calib_ul_buffer_(calib_ul_buffer),
-      phy_stats_(in_phy_stats) {
+DoFFT::DoFFT(Config* config, size_t tid, AgoraBuffer* buffer,
+             PhyStats* in_phy_stats, Stats* stats_manager)
+    : Doer(config, tid), buffer_(buffer), phy_stats_(in_phy_stats) {
   duration_stat_fft_ = stats_manager->GetDurationStat(DoerType::kFFT, tid);
   duration_stat_csi_ = stats_manager->GetDurationStat(DoerType::kCSI, tid);
   DftiCreateDescriptor(&mkl_handle_, DFTI_SINGLE, DFTI_COMPLEX, 1,
@@ -30,6 +26,9 @@ DoFFT::DoFFT(Config* config, size_t tid, Table<complex_float>& data_buffer,
 
   // Aligned for SIMD
   fft_inout_ = static_cast<complex_float*>(Agora_memory::PaddedAlignedAlloc(
+      Agora_memory::Alignment_t::kAlign64,
+      cfg_->OfdmCaNum() * sizeof(complex_float)));
+  fft_shift_tmp_ = static_cast<complex_float*>(Agora_memory::PaddedAlignedAlloc(
       Agora_memory::Alignment_t::kAlign64,
       cfg_->OfdmCaNum() * sizeof(complex_float)));
   temp_16bits_iq_ = static_cast<uint16_t*>(Agora_memory::PaddedAlignedAlloc(
@@ -43,6 +42,7 @@ DoFFT::DoFFT(Config* config, size_t tid, Table<complex_float>& data_buffer,
 DoFFT::~DoFFT() {
   DftiFreeDescriptor(&mkl_handle_);
   std::free(fft_inout_);
+  std::free(fft_shift_tmp_);
   std::free(rx_samps_tmp_);
   std::free(temp_16bits_iq_);
 }
@@ -181,19 +181,28 @@ EventData DoFFT::Launch(size_t tag) {
         reinterpret_cast<float*>(fft_inout_));  // Compute FFT in-place
   }
 
+  //// FFT shift the buffer
+  std::memcpy(fft_shift_tmp_, fft_inout_, sizeof(float) * cfg_->OfdmCaNum());
+  std::memcpy(fft_inout_, fft_inout_ + cfg_->OfdmCaNum() / 2,
+              sizeof(float) * cfg_->OfdmCaNum());
+  std::memcpy(fft_inout_ + cfg_->OfdmCaNum() / 2, fft_shift_tmp_,
+              sizeof(float) * cfg_->OfdmCaNum());
+
   size_t start_tsc2 = GetTime::WorkerRdtsc();
   duration_stat->task_duration_.at(2) += start_tsc2 - start_tsc1;
 
   if (sym_type == SymbolType::kPilot) {
     size_t pilot_symbol_id = cfg_->Frame().GetPilotSymbolIdx(symbol_id);
     if (kCollectPhyStats) {
-      phy_stats_->UpdatePilotSnr(frame_id, pilot_symbol_id, ant_id, fft_inout_);
+      phy_stats_->UpdateUlPilotSnr(frame_id, pilot_symbol_id, ant_id,
+                                   fft_inout_);
     }
     const size_t ue_id = pilot_symbol_id;
-    PartialTranspose(csi_buffers_[frame_slot][ue_id], ant_id,
+    PartialTranspose(buffer_->GetCsiBuffer(frame_slot, ue_id), ant_id,
                      SymbolType::kPilot);
   } else if (sym_type == SymbolType::kUL) {
-    PartialTranspose(cfg_->GetDataBuf(data_buffer_, frame_id, symbol_id),
+    PartialTranspose(buffer_->GetDataBuffer(
+                         cfg_->GetIndexForFrameAndSymbol(frame_id, symbol_id)),
                      ant_id, SymbolType::kUL);
   } else if (sym_type == SymbolType::kCalUL) {
     // Only process uplink for antennas that also do downlink in this frame
@@ -206,7 +215,7 @@ EventData DoFFT::Launch(size_t tag) {
           tid_, frame_id, symbol_id, ant_id, cal_index);
 
       complex_float* calib_ul_ptr =
-          &calib_ul_buffer_[cal_index][ant_id * cfg_->OfdmDataNum()];
+          &buffer_->GetCalibUlBuffer(cal_index)[ant_id * cfg_->OfdmDataNum()];
 
       PartialTranspose(calib_ul_ptr, ant_id, sym_type);
       phy_stats_->UpdateCalibPilotSnr(cal_index, 1, ant_id, fft_inout_);
@@ -225,8 +234,8 @@ EventData DoFFT::Launch(size_t tag) {
           tid_, frame_id, symbol_id, pilot_tx_ant, cal_index);
       RtAssert(cal_index != SIZE_MAX, "Out of bounds index");
 
-      complex_float* calib_dl_ptr =
-          &calib_dl_buffer_[cal_index][pilot_tx_ant * cfg_->OfdmDataNum()];
+      complex_float* calib_dl_ptr = &buffer_->GetCalibDlBuffer(
+          cal_index)[pilot_tx_ant * cfg_->OfdmDataNum()];
       PartialTranspose(calib_dl_ptr, pilot_tx_ant, sym_type);
       phy_stats_->UpdateCalibPilotSnr(cal_index, 0, pilot_tx_ant, fft_inout_);
     }

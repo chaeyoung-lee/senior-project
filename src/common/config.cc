@@ -9,34 +9,51 @@
 
 #include "config.h"
 
-#include <boost/range/algorithm/count.hpp>
+#include <ctime>
+#include <filesystem>
+#include <utility>
 
+#include "comms-lib.h"
+#include "gettime.h"
 #include "logger.h"
+#include "message.h"
+#include "modulation.h"
 #include "scrambler.h"
 #include "utils_ldpc.h"
 
 using json = nlohmann::json;
 
-static const size_t kMacAlignmentBytes = 64u;
+static constexpr size_t kMacAlignmentBytes = 64u;
 static constexpr bool kDebugPrintConfiguration = false;
-static const size_t kMaxSupportedZc = 256;
+static constexpr size_t kMaxSupportedZc = 256;
+static constexpr size_t kShortIdLen = 3;
 
-Config::Config(const std::string& jsonfile)
+static const std::string kLogFilepath =
+    TOSTRING(PROJECT_DIRECTORY) "/files/log/";
+static const std::string kExperimentFilepath =
+    TOSTRING(PROJECT_DIRECTORY) "/files/experiment/";
+static const std::string kUlDataFilePrefix =
+    kExperimentFilepath + "LDPC_orig_ul_data_";
+static const std::string kDlDataFilePrefix =
+    kExperimentFilepath + "LDPC_orig_dl_data_";
+
+Config::Config(std::string jsonfilename)
     : freq_ghz_(GetTime::MeasureRdtscFreq()),
       ul_ldpc_config_(0, 0, 0, false, 0, 0, 0, 0),
       dl_ldpc_config_(0, 0, 0, false, 0, 0, 0, 0),
-      frame_("") {
+      frame_(""),
+      config_filename_(std::move(jsonfilename)) {
   pilots_ = nullptr;
   pilots_sgn_ = nullptr;
 
   std::string conf;
-  Utils::LoadTddConfig(jsonfile, conf);
+  Utils::LoadTddConfig(config_filename_, conf);
   // Allow json comments
   const auto tdd_conf = json::parse(conf, nullptr, true, true);
 
   // Initialize the compute configuration
   // Default exclude 1 core with id = 0
-  excluded.emplace_back(0);
+  std::vector<size_t> excluded(1, 0);
   if (tdd_conf.contains("exclude_cores")) {
     auto exclude_cores = tdd_conf.at("exclude_cores");
     excluded.resize(exclude_cores.size());
@@ -44,7 +61,6 @@ Config::Config(const std::string& jsonfile)
       excluded.at(i) = exclude_cores.at(i);
     }
   }
-  dynamic_core_allocation_ = tdd_conf.value("dynamic_core", false);
   SetCpuLayoutOnNumaNodes(true, excluded);
 
   num_cells_ = tdd_conf.value("cells", 1);
@@ -130,8 +146,18 @@ Config::Config(const std::string& jsonfile)
 
   if (ue_radio_id_.empty() == false) {
     ue_num_ = ue_radio_id_.size();
+    for (size_t i = 0; i < ue_num_; i++) {
+      ue_radio_name_.push_back(
+          "UE" + (ue_radio_id_.at(i).length() > kShortIdLen
+                      ? ue_radio_id_.at(i).substr(ue_radio_id_.at(i).length() -
+                                                  kShortIdLen)
+                      : ue_radio_id_.at(i)));
+    }
   } else {
     ue_num_ = tdd_conf.value("ue_radio_num", 8);
+    for (size_t i = 0; i < ue_num_; i++) {
+      ue_radio_name_.push_back("UE" + std::to_string(i));
+    }
   }
 
   channel_ = tdd_conf.value("channel", "A");
@@ -210,6 +236,13 @@ Config::Config(const std::string& jsonfile)
   sample_cal_en_ = tdd_conf.value("calibrate_digital", false);
   imbalance_cal_en_ = tdd_conf.value("calibrate_analog", false);
   init_calib_repeat_ = tdd_conf.value("init_calib_repeat", 0);
+  beamforming_str_ = tdd_conf.value("beamforming", "ZF");
+  beamforming_algo_ = kBeamformingStr.at(beamforming_str_);
+
+  RtAssert(sample_cal_en_ == false,
+           "Digital / Sample offset calibration is not supported at this time");
+  RtAssert(imbalance_cal_en_ == false,
+           "Analog / imbalance calibration is not supported at this time");
 
   bs_server_addr_ = tdd_conf.value("bs_server_addr", "127.0.0.1");
   bs_rru_addr_ = tdd_conf.value("bs_rru_addr", "127.0.0.1");
@@ -228,10 +261,6 @@ Config::Config(const std::string& jsonfile)
   ue_mac_rx_port_ = tdd_conf.value("ue_mac_rx_port", kMacUserLocalPort);
   bs_mac_tx_port_ = tdd_conf.value("bs_mac_tx_port", kMacBaseRemotePort);
   bs_mac_rx_port_ = tdd_conf.value("bs_mac_rx_port", kMacBaseLocalPort);
-
-  rp_remote_host_name_ = tdd_conf.value("rp_remote_host_name", "127.0.0.1");
-  rp_rx_port_ = tdd_conf.value("rp_rx_port", 7777);
-  rp_tx_port_ = tdd_conf.value("rp_tx_port", 7070);
 
   /* frame configurations */
   cp_len_ = tdd_conf.value("cp_size", 0);
@@ -478,23 +507,47 @@ Config::Config(const std::string& jsonfile)
              "tx_advance size must be same as the number of clients!");
     cl_tx_advance_.assign(tx_advance.begin(), tx_advance.end());
   }
-  
+
+  if (std::filesystem::is_directory(kExperimentFilepath) == false) {
+    std::filesystem::create_directory(kExperimentFilepath);
+  }
+
+  if (std::filesystem::is_directory(kLogFilepath) == false) {
+    std::filesystem::create_directory(kLogFilepath);
+  }
+
+  // set trace file path
+  auto time = std::time(nullptr);
+  auto local_time = *std::localtime(&time);
+
+  const std::string ul_present_str = (frame_.NumULSyms() > 0 ? "uplink-" : "");
+  const std::string dl_present_str =
+      (frame_.NumDLSyms() > 0 ? "downlink-" : "");
+  std::string filename =
+      kLogFilepath + "trace-" + ul_present_str + dl_present_str +
+      std::to_string(1900 + local_time.tm_year) + "-" +
+      std::to_string(1 + local_time.tm_mon) + "-" +
+      std::to_string(local_time.tm_mday) + "-" +
+      std::to_string(local_time.tm_hour) + "-" +
+      std::to_string(local_time.tm_min) + "-" +
+      std::to_string(local_time.tm_sec) + "_" + std::to_string(num_cells_) +
+      "_" + std::to_string(BsAntNum()) + "x" + std::to_string(UeAntTotal()) +
+      ".hdf5";
+  trace_file_ = tdd_conf.value("trace_file", filename);
+
+  // Agora configurations
   frames_to_test_ = tdd_conf.value("max_frame", 9600);
   core_offset_ = tdd_conf.value("core_offset", 0);
+  worker_thread_num_ = tdd_conf.value("worker_thread_num", 25);
   socket_thread_num_ = tdd_conf.value("socket_thread_num", 4);
-  if (dynamic_core_allocation_) {
-    worker_thread_num_ = GetAvailableCores() - (core_offset_ + socket_thread_num_ + dynamic_core_allocation_ + 1); // use all available cores
-  } else {
-    worker_thread_num_ = tdd_conf.value("worker_thread_num", 25);
-  }
   ue_core_offset_ = tdd_conf.value("ue_core_offset", 0);
   ue_worker_thread_num_ = tdd_conf.value("ue_worker_thread_num", 25);
   ue_socket_thread_num_ = tdd_conf.value("ue_socket_thread_num", 4);
   fft_thread_num_ = tdd_conf.value("fft_thread_num", 5);
   demul_thread_num_ = tdd_conf.value("demul_thread_num", 5);
   decode_thread_num_ = tdd_conf.value("decode_thread_num", 10);
-  zf_thread_num_ = worker_thread_num_ - fft_thread_num_ - demul_thread_num_ -
-                   decode_thread_num_;
+  beam_thread_num_ = worker_thread_num_ - fft_thread_num_ - demul_thread_num_ -
+                     decode_thread_num_;
 
   demul_block_size_ = tdd_conf.value("demul_block_size", 48);
   RtAssert(demul_block_size_ % kSCsPerCacheline == 0,
@@ -505,10 +558,11 @@ Config::Config(const std::string& jsonfile)
       "Demodulation block size must be a multiple of transpose block size");
   demul_events_per_symbol_ = 1 + (ofdm_data_num_ - 1) / demul_block_size_;
 
-  zf_batch_size_ = tdd_conf.value("zf_batch_size", 1);
-  zf_block_size_ =
-      freq_orthogonal_pilot_ ? ue_ant_num_ : tdd_conf.value("zf_block_size", 1);
-  zf_events_per_symbol_ = 1 + (ofdm_data_num_ - 1) / zf_block_size_;
+  beam_batch_size_ = tdd_conf.value("beam_batch_size", 1);
+  beam_block_size_ = freq_orthogonal_pilot_
+                         ? ue_ant_num_
+                         : tdd_conf.value("beam_block_size", 1);
+  beam_events_per_symbol_ = 1 + (ofdm_data_num_ - 1) / beam_block_size_;
 
   fft_block_size_ = tdd_conf.value("fft_block_size", 1);
   fft_block_size_ = std::max(fft_block_size_, num_channels_);
@@ -574,30 +628,68 @@ Config::Config(const std::string& jsonfile)
   dl_mac_bytes_num_perframe_ = dl_mac_packet_length_ * dl_mac_packets_perframe_;
 
   this->running_.store(true);
+  /* 12 bit samples x2 for I + Q */
+  static const size_t kBitsPerSample = 12 * 2;
+  const double bit_rate_mbps = (rate_ * kBitsPerSample) / 1e6;
+  //For framer mode, we can ignore the Beacon
+  //Double count the UlCal and DLCal to simplify things
+  //Peak network traffic is the bit rate for 1 symbol, for non-hardware framer mode
+  //the device can generate 2*rate_ traffic (for each tx symbol)
+  const size_t bs_tx_symbols =
+      frame_.NumDLSyms() + frame_.NumDLCalSyms() + frame_.NumULCalSyms();
+  const size_t bs_rx_symbols = frame_.NumPilotSyms() + frame_.NumULSyms() +
+                               frame_.NumDLCalSyms() + frame_.NumULCalSyms();
+  const double per_bs_radio_traffic =
+      ((static_cast<double>(bs_tx_symbols + bs_rx_symbols)) /
+       frame_.NumTotalSyms()) *
+      bit_rate_mbps;
+
+  const size_t ue_tx_symbols = frame_.NumULSyms() + frame_.NumPilotSyms();
+  //Rx all symbols, Tx the tx symbols (ul + pilots)
+  const double per_ue_radio_traffic =
+      (bit_rate_mbps *
+       (static_cast<double>(ue_tx_symbols) / frame_.NumTotalSyms())) +
+      bit_rate_mbps;
+
   AGORA_LOG_INFO(
-      "Config: %zu BS antennas, %zu UE antennas, %zu pilot symbols per frame,\n"
-      "\t%zu uplink data symbols per frame, %zu downlink data symbols per "
+      "Config: %zu BS antennas, %zu UE antennas, %zu pilot symbols per "
       "frame,\n"
+      "\t%zu uplink data symbols per frame, %zu downlink data symbols "
+      "per frame,\n"
       "\t%zu OFDM subcarriers (%zu data subcarriers),\n"
-      "\tUL modulation %s, DL modulation %s,\n\t%zu UL codeblocks per symbol, "
+      "\tUL modulation %s, DL modulation %s, Beamforming %s, \n"
+      "\t%zu UL codeblocks per symbol, "
       "%zu UL bytes per code block,\n"
       "\t%zu DL codeblocks per symbol, %zu DL bytes per code block,\n"
       "\t%zu UL MAC data bytes per frame, %zu UL MAC bytes per frame,\n"
       "\t%zu DL MAC data bytes per frame, %zu DL MAC bytes per frame,\n"
       "\tFrame time %.3f usec\n"
       "Uplink Max Mac data per-user tp (Mbps) %.3f\n"
-      "Downlink Max Mac data per-user tp (Mbps) %.3f \n",
+      "Downlink Max Mac data per-user tp (Mbps) %.3f\n"
+      "Radio Network Traffic Peak (Mbps): %.3f\n"
+      "Radio Network Traffic Avg  (Mbps): %.3f\n"
+      "Basestation Network Traffic Peak (Mbps): %.3f\n"
+      "Basestation Network Traffic Avg  (Mbps): %.3f\n"
+      "UE Network Traffic Peak (Mbps): %.3f\n"
+      "UE Network Traffic Avg  (Mbps): %.3f\n"
+      "All UEs Network Traffic Avg (Mbps): %.3f\n"
+      "All UEs Network Traffic Avg (Mbps): %.3f\n",
       bs_ant_num_, ue_ant_num_, frame_.NumPilotSyms(), frame_.NumULSyms(),
       frame_.NumDLSyms(), ofdm_ca_num_, ofdm_data_num_, ul_modulation_.c_str(),
-      dl_modulation_.c_str(), ul_ldpc_config_.NumBlocksInSymbol(),
-      ul_num_bytes_per_cb_, dl_ldpc_config_.NumBlocksInSymbol(),
-      dl_num_bytes_per_cb_, ul_mac_data_bytes_num_perframe_,
-      ul_mac_bytes_num_perframe_, dl_mac_data_bytes_num_perframe_,
-      dl_mac_bytes_num_perframe_, this->GetFrameDurationSec() * 1e6,
+      dl_modulation_.c_str(), beamforming_str_.c_str(),
+      ul_ldpc_config_.NumBlocksInSymbol(), ul_num_bytes_per_cb_,
+      dl_ldpc_config_.NumBlocksInSymbol(), dl_num_bytes_per_cb_,
+      ul_mac_data_bytes_num_perframe_, ul_mac_bytes_num_perframe_,
+      dl_mac_data_bytes_num_perframe_, dl_mac_bytes_num_perframe_,
+      this->GetFrameDurationSec() * 1e6,
       (ul_mac_data_bytes_num_perframe_ * 8.0f) /
           (this->GetFrameDurationSec() * 1e6),
       (dl_mac_data_bytes_num_perframe_ * 8.0f) /
-          (this->GetFrameDurationSec() * 1e6));
+          (this->GetFrameDurationSec() * 1e6),
+      bit_rate_mbps, per_bs_radio_traffic, bit_rate_mbps * bs_ant_num_,
+      per_bs_radio_traffic * bs_ant_num_, 2 * bit_rate_mbps,
+      per_ue_radio_traffic, 2 * bit_rate_mbps * ue_ant_num_,
+      per_ue_radio_traffic * ue_ant_num_);
 
   if (frame_.IsRecCalEnabled()) {
     AGORA_LOG_INFO(
@@ -862,7 +954,11 @@ void Config::GenData() {
   AllocBuffer1d(&pilot_ifft, this->ofdm_ca_num_,
                 Agora_memory::Alignment_t::kAlign64, 1);
   for (size_t j = 0; j < ofdm_data_num_; j++) {
-    pilot_ifft[j + this->ofdm_data_start_] = this->pilots_[j];
+    // FFT Shift
+    const size_t k = j + ofdm_data_start_ >= ofdm_ca_num_ / 2
+                         ? j + ofdm_data_start_ - ofdm_ca_num_ / 2
+                         : j + ofdm_data_start_ + ofdm_ca_num_ / 2;
+    pilot_ifft[k] = this->pilots_[j];
   }
   CommsLib::IFFT(pilot_ifft, this->ofdm_ca_num_, false);
 
@@ -885,8 +981,11 @@ void Config::GenData() {
     for (size_t j = 0; j < this->ofdm_data_num_; j++) {
       this->ue_specific_pilot_[i][j] = {zc_ue_pilot_i[j].real(),
                                         zc_ue_pilot_i[j].imag()};
-      ue_pilot_ifft[i][j + this->ofdm_data_start_] =
-          this->ue_specific_pilot_[i][j];
+      // FFT Shift
+      const size_t k = j + ofdm_data_start_ >= ofdm_ca_num_ / 2
+                           ? j + ofdm_data_start_ - ofdm_ca_num_ / 2
+                           : j + ofdm_data_start_ + ofdm_ca_num_ / 2;
+      ue_pilot_ifft[i][k] = this->ue_specific_pilot_[i][j];
     }
     CommsLib::IFFT(ue_pilot_ifft[i], ofdm_ca_num_, false);
   }
@@ -897,7 +996,7 @@ void Config::GenData() {
   dl_bits_.Malloc(this->frame_.NumDLSyms(),
                   dl_num_bytes_per_ue_pad * this->ue_ant_num_,
                   Agora_memory::Alignment_t::kAlign64);
-  dl_iq_f_.Calloc(this->frame_.NumDLSyms(), ofdm_ca_num_ * ue_ant_num_,
+  dl_iq_f_.Calloc(this->frame_.NumDLSyms(), ofdm_data_num_ * ue_ant_num_,
                   Agora_memory::Alignment_t::kAlign64);
   dl_iq_t_.Calloc(this->frame_.NumDLSyms(),
                   this->samps_per_symbol_ * this->ue_ant_num_,
@@ -909,7 +1008,7 @@ void Config::GenData() {
                   ul_num_bytes_per_ue_pad * this->ue_ant_num_,
                   Agora_memory::Alignment_t::kAlign64);
   ul_iq_f_.Calloc(this->frame_.NumULSyms(),
-                  this->ofdm_ca_num_ * this->ue_ant_num_,
+                  this->ofdm_data_num_ * this->ue_ant_num_,
                   Agora_memory::Alignment_t::kAlign64);
   ul_iq_t_.Calloc(this->frame_.NumULSyms(),
                   this->samps_per_symbol_ * this->ue_ant_num_,
@@ -928,11 +1027,10 @@ void Config::GenData() {
     }
   }
 #else
-  std::string cur_directory = TOSTRING(PROJECT_DIRECTORY);
   if (this->frame_.NumUlDataSyms() > 0) {
-    std::string ul_data_file = cur_directory + "/data/LDPC_orig_ul_data_" +
-                               std::to_string(this->ofdm_ca_num_) + "_ant" +
-                               std::to_string(this->ue_ant_total_) + ".bin";
+    const std::string ul_data_file =
+        kUlDataFilePrefix + std::to_string(this->ofdm_ca_num_) + "_ant" +
+        std::to_string(this->ue_ant_total_) + ".bin";
     AGORA_LOG_SYMBOL("Config: Reading raw ul data from %s\n",
                      ul_data_file.c_str());
     FILE* fd = std::fopen(ul_data_file.c_str(), "rb");
@@ -978,9 +1076,9 @@ void Config::GenData() {
   }
 
   if (this->frame_.NumDlDataSyms() > 0) {
-    std::string dl_data_file = cur_directory + "/data/LDPC_orig_dl_data_" +
-                               std::to_string(this->ofdm_ca_num_) + "_ant" +
-                               std::to_string(this->ue_ant_total_) + ".bin";
+    const std::string dl_data_file =
+        kDlDataFilePrefix + std::to_string(this->ofdm_ca_num_) + "_ant" +
+        std::to_string(this->ue_ant_total_) + ".bin";
 
     AGORA_LOG_SYMBOL("Config: Reading raw dl data from %s\n",
                      dl_data_file.c_str());
@@ -1070,16 +1168,19 @@ void Config::GenData() {
                     Agora_memory::Alignment_t::kAlign64);
   for (size_t i = 0; i < this->frame_.NumULSyms(); i++) {
     for (size_t u = 0; u < this->ue_ant_num_; u++) {
-      size_t q = u * this->ofdm_ca_num_;
+      size_t q = u * ofdm_data_num_;
 
-      for (size_t j = this->ofdm_data_start_; j < this->ofdm_data_stop_; j++) {
-        size_t k = j - ofdm_data_start_;
+      for (size_t j = 0; j < ofdm_data_num_; j++) {
+        size_t sc = j + ofdm_data_start_;
         int8_t* mod_input_ptr =
-            GetModBitsBuf(ul_mod_bits_, Direction::kUplink, 0, i, u, k);
+            GetModBitsBuf(ul_mod_bits_, Direction::kUplink, 0, i, u, j);
         ul_iq_f_[i][q + j] = ModSingleUint8(*mod_input_ptr, ul_mod_table_);
-        ul_iq_ifft[i][q + j] = ul_iq_f_[i][q + j];
+        // FFT Shift
+        const size_t k = sc >= ofdm_ca_num_ / 2 ? sc - ofdm_ca_num_ / 2
+                                                : sc + ofdm_ca_num_ / 2;
+        ul_iq_ifft[i][u * ofdm_ca_num_ + k] = ul_iq_f_[i][q + j];
       }
-      CommsLib::IFFT(&ul_iq_ifft[i][q], ofdm_ca_num_, false);
+      CommsLib::IFFT(&ul_iq_ifft[i][u * ofdm_ca_num_], ofdm_ca_num_, false);
     }
   }
 
@@ -1140,21 +1241,24 @@ void Config::GenData() {
                     Agora_memory::Alignment_t::kAlign64);
   for (size_t i = 0; i < this->frame_.NumDLSyms(); i++) {
     for (size_t u = 0; u < ue_ant_num_; u++) {
-      size_t q = u * ofdm_ca_num_;
+      size_t q = u * ofdm_data_num_;
 
-      for (size_t j = ofdm_data_start_; j < ofdm_data_stop_; j++) {
-        int k = j - ofdm_data_start_;
-        if (IsDataSubcarrier(k) == true) {
+      for (size_t j = 0; j < ofdm_data_num_; j++) {
+        size_t sc = j + ofdm_data_start_;
+        if (IsDataSubcarrier(j) == true) {
           int8_t* mod_input_ptr =
               GetModBitsBuf(dl_mod_bits_, Direction::kDownlink, 0, i, u,
-                            this->GetOFDMDataIndex(k));
+                            this->GetOFDMDataIndex(j));
           dl_iq_f_[i][q + j] = ModSingleUint8(*mod_input_ptr, dl_mod_table_);
         } else {
-          dl_iq_f_[i][q + j] = ue_specific_pilot_[u][k];
+          dl_iq_f_[i][q + j] = ue_specific_pilot_[u][j];
         }
-        dl_iq_ifft[i][q + j] = dl_iq_f_[i][q + j];
+        // FFT Shift
+        const size_t k = sc >= ofdm_ca_num_ / 2 ? sc - ofdm_ca_num_ / 2
+                                                : sc + ofdm_ca_num_ / 2;
+        dl_iq_ifft[i][u * ofdm_ca_num_ + k] = dl_iq_f_[i][q + j];
       }
-      CommsLib::IFFT(&dl_iq_ifft[i][q], ofdm_ca_num_, false);
+      CommsLib::IFFT(&dl_iq_ifft[i][u * ofdm_ca_num_], ofdm_ca_num_, false);
     }
   }
 
@@ -1418,6 +1522,7 @@ void Config::Print() const {
               << "Beamsweep " << beamsweep_ << std::endl
               << "Sample Cal En: " << sample_cal_en_ << std::endl
               << "Imbalance Cal: " << imbalance_cal_en_ << std::endl
+              << "Beamforming: " << beamforming_str_ << std::endl
               << "Bs Channel: " << channel_ << std::endl
               << "Ue Channel: " << ue_channel_ << std::endl
               << "Max Frames: " << frames_to_test_ << std::endl

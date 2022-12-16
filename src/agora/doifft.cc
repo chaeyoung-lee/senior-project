@@ -4,8 +4,12 @@
  */
 #include "doifft.h"
 
+#include "comms-lib.h"
 #include "concurrent_queue_wrapper.h"
 #include "datatype_conversion.h"
+#include "gettime.h"
+#include "logger.h"
+#include "message.h"
 
 static constexpr bool kPrintIFFTOutput = false;
 static constexpr bool kPrintSocketOutput = false;
@@ -13,12 +17,9 @@ static constexpr bool kUseOutOfPlaceIFFT = false;
 static constexpr bool kMemcpyBeforeIFFT = true;
 static constexpr bool kPrintIfftStats = false;
 
-DoIFFT::DoIFFT(Config* in_config, int in_tid,
-               Table<complex_float>& in_dl_ifft_buffer,
-               char* in_dl_socket_buffer, Stats* in_stats_manager)
-    : Doer(in_config, in_tid),
-      dl_ifft_buffer_(in_dl_ifft_buffer),
-      dl_socket_buffer_(in_dl_socket_buffer) {
+DoIFFT::DoIFFT(Config* in_config, int in_tid, AgoraBuffer* buffer,
+               Stats* in_stats_manager)
+    : Doer(in_config, in_tid), buffer_(buffer) {
   duration_stat_ = in_stats_manager->GetDurationStat(DoerType::kIFFT, in_tid);
   DftiCreateDescriptor(&mkl_handle_, DFTI_SINGLE, DFTI_COMPLEX, 1,
                        cfg_->OfdmCaNum());
@@ -31,12 +32,16 @@ DoIFFT::DoIFFT(Config* in_config, int in_tid,
   ifft_out_ = static_cast<float*>(
       Agora_memory::PaddedAlignedAlloc(Agora_memory::Alignment_t::kAlign64,
                                        2 * cfg_->OfdmCaNum() * sizeof(float)));
+  ifft_shift_tmp_ = static_cast<complex_float*>(
+      Agora_memory::PaddedAlignedAlloc(Agora_memory::Alignment_t::kAlign64,
+                                       2 * cfg_->OfdmCaNum() * sizeof(float)));
   ifft_scale_factor_ = cfg_->OfdmCaNum();
 }
 
 DoIFFT::~DoIFFT() {
   DftiFreeDescriptor(&mkl_handle_);
   std::free(ifft_out_);
+  std::free(ifft_shift_tmp_);
 }
 
 EventData DoIFFT::Launch(size_t tag) {
@@ -61,17 +66,19 @@ EventData DoIFFT::Launch(size_t tag) {
   const size_t start_tsc1 = GetTime::WorkerRdtsc();
   duration_stat_->task_duration_[1u] += start_tsc1 - start_tsc;
 
-  auto* ifft_in_ptr = reinterpret_cast<float*>(dl_ifft_buffer_[offset]);
+  auto* ifft_in_ptr =
+      reinterpret_cast<float*>(buffer_->GetDlIfftBuffer(offset));
   auto* ifft_out_ptr =
       (kUseOutOfPlaceIFFT || kMemcpyBeforeIFFT) ? ifft_out_ : ifft_in_ptr;
 
+  std::memset(ifft_in_ptr, 0, sizeof(float) * cfg_->OfdmDataStart() * 2);
+  std::memset(ifft_in_ptr + (cfg_->OfdmDataStop()) * 2, 0,
+              sizeof(float) * cfg_->OfdmDataStart() * 2);
+  CommsLib::FFTShift(reinterpret_cast<complex_float*>(ifft_in_ptr),
+                     ifft_shift_tmp_, cfg_->OfdmCaNum());
   if (kMemcpyBeforeIFFT) {
-    std::memset(ifft_out_ptr, 0, sizeof(float) * cfg_->OfdmDataStart() * 2);
-    std::memset(ifft_out_ptr + (cfg_->OfdmDataStop() * 2), 0,
-                sizeof(float) * cfg_->OfdmDataStart() * 2);
-    std::memcpy(ifft_out_ptr + (cfg_->OfdmDataStart() * 2),
-                ifft_in_ptr + (cfg_->OfdmDataStart() * 2),
-                sizeof(float) * cfg_->OfdmDataNum() * 2);
+    std::memcpy(ifft_out_ptr, ifft_in_ptr,
+                sizeof(float) * cfg_->OfdmCaNum() * 2);
     DftiComputeBackward(mkl_handle_, ifft_out_ptr);
   } else {
     if (kUseOutOfPlaceIFFT) {
@@ -80,9 +87,6 @@ EventData DoIFFT::Launch(size_t tag) {
       // to 0 since their values are not changed after IFFT
       DftiComputeBackward(mkl_handle_, ifft_in_ptr, ifft_out_ptr);
     } else {
-      std::memset(ifft_in_ptr, 0u, sizeof(float) * cfg_->OfdmDataStart() * 2);
-      std::memset(ifft_in_ptr + (cfg_->OfdmDataStop()) * 2, 0u,
-                  sizeof(float) * cfg_->OfdmDataStart() * 2);
       DftiComputeBackward(mkl_handle_, ifft_in_ptr);
     }
   }
@@ -95,7 +99,9 @@ EventData DoIFFT::Launch(size_t tag) {
       clipping = true;
       break;
     }
-    if (std::abs(sample_val) > max_abs) max_abs = std::abs(sample_val);
+    if (std::abs(sample_val) > max_abs) {
+      max_abs = std::abs(sample_val);
+    }
   }
   if (clipping) {
     AGORA_LOG_WARN("Clipping occured in Frame %zu, Symbol %zu, Antenna %zu\n",
@@ -114,8 +120,8 @@ EventData DoIFFT::Launch(size_t tag) {
     ss << "IFFT_output" << ant_id << "=[";
     for (size_t i = 0; i < cfg_->OfdmCaNum(); i++) {
       ss << std::fixed << std::setw(5) << std::setprecision(3)
-         << dl_ifft_buffer_[offset][i].re << "+1j*"
-         << dl_ifft_buffer_[offset][i].im << " ";
+         << buffer_->GetDlIfftBuffer(offset)[i].re << "+1j*"
+         << buffer_->GetDlIfftBuffer(offset)[i].im << " ";
     }
     ss << "];" << std::endl;
     std::cout << ss.str();
@@ -125,13 +131,13 @@ EventData DoIFFT::Launch(size_t tag) {
   duration_stat_->task_duration_[2u] += start_tsc2 - start_tsc1;
 
   auto* pkt = reinterpret_cast<struct Packet*>(
-      &dl_socket_buffer_[offset * cfg_->DlPacketLength()]);
+      &buffer_->GetDlSocketBuffer()[offset * cfg_->DlPacketLength()]);
   short* socket_ptr = &pkt->data_[2u * cfg_->OfdmTxZeroPrefix()];
 
   // IFFT scaled results by OfdmCaNum(), we scale down IFFT results
-  // during data type coversion
-  SimdConvertFloatToShort(ifft_out_ptr, socket_ptr, cfg_->OfdmCaNum(),
-                          cfg_->CpLen(), ifft_scale_factor_);
+  // during data type coversion.  * 2 complex float -> float
+  SimdConvertFloatToShort(ifft_out_ptr, socket_ptr, cfg_->OfdmCaNum() * 2,
+                          cfg_->CpLen() * 2, ifft_scale_factor_);
 
   duration_stat_->task_duration_[3u] += GetTime::WorkerRdtsc() - start_tsc2;
 

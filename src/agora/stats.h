@@ -6,11 +6,14 @@
 #ifndef STATS_H_
 #define STATS_H_
 
-#include <iostream>
+#include <array>
+#include <cstddef>
+#include <string>
 
 #include "config.h"
 #include "gettime.h"
 #include "memory_manage.h"
+#include "message.h"
 #include "symbols.h"
 
 static constexpr size_t kMaxStatBreakdown = 4;
@@ -40,7 +43,7 @@ enum class TsType : size_t {
   kPilotAllRX,         // All pilot packets received
   kRCAllRX,            // All Reciprocity Calibration Symbols received
   kFFTPilotsDone,      // Completed FFT for all pilots in this frame
-  kZFDone,             // Completed zeroforcing for this frame
+  kBeamDone,           // Completed zeroforcing for this frame
   kDemulDone,          // Completed demodulation for this frame
   kRXDone,             // All packets of a frame received
   kRCDone,             // Recirocity Calibration Computation done
@@ -65,10 +68,6 @@ class Stats {
   /// If worker stats collection is enabled, combine and update per-worker
   /// stats for all uplink and donwlink Doer types. Else return immediately.
   void UpdateStats(size_t frame_id);
-  
-  /// Measure the last frame latency
-  /// Time done with decoding - time starting process
-  double MeasureLastFrameLatency();
 
   /// Save master timestamps to a file. If worker stats collection is enabled,
   /// also save detailed worker timing info to a file.
@@ -152,6 +151,12 @@ class Stats {
                                this->freq_ghz_);
   }
 
+  void PrintPerFrameDone(PrintType print_type, size_t frame_id);
+  void PrintPerSymbolDone(PrintType print_type, size_t frame_id,
+                          size_t symbol_id, FrameCounters counters) const;
+  void PrintPerTaskDone(PrintType print_type, size_t frame_id, size_t symbol_id,
+                        size_t ant_or_sc_id, FrameCounters counters);
+
   /// Get the DurationStat object used by thread thread_id for DoerType
   /// doer_type
   DurationStat* GetDurationStat(DoerType doer_type, size_t thread_id) {
@@ -192,7 +197,7 @@ class Stats {
 
   const size_t task_thread_num_;
   const size_t fft_thread_num_;
-  const size_t zf_thread_num_;
+  const size_t beam_thread_num_;
   const size_t demul_thread_num_;
   const size_t decode_thread_num_;
   const size_t break_down_num_ = kMaxStatBreakdown;

@@ -8,8 +8,11 @@
 
 #include "utils.h"
 
+#include <cassert>
 #include <list>
 #include <mutex>
+
+#include "datatype_conversion.h"
 
 struct CoreInfo {
   CoreInfo(size_t id, size_t mapped, size_t req, ThreadType type)
@@ -78,71 +81,43 @@ void PrintCoreAssignmentSummary() { PrintCoreList(core_list); }
 
 void SetCpuLayoutOnNumaNodes(bool verbose,
                              const std::vector<size_t>& cores_to_exclude) {
-  int lib_accessable = numa_available();
-  if (lib_accessable == -1) {
-    throw std::runtime_error("libnuma not accessable");
-  }
-  int numa_max_cpus = numa_num_configured_cpus();
-  if (verbose) {std::printf("System CPU count %d\n", numa_max_cpus);}
-
-  // Find available cpus in this machine
-  std::ifstream file("/sys/fs/cgroup/cpuset/cpuset.cpus");
-  std::string s;
-  std::getline(file, s);
-  size_t start_core = (size_t) stoi(s.substr(0, s.find("-")));
-  size_t end_core = (size_t) stoi(s.substr(s.find("-") + 1));
-
-  bitmask* bm = numa_bitmask_alloc(numa_max_cpus);
-  for (int i = 0; i <= numa_max_node(); ++i) {
-    numa_node_to_cpus(i, bm);
-    if (verbose) {
-      std::printf("NUMA node %d ", i);
-      PrintBitmask(bm);
-      std::printf(" CPUs: ");
+  if (cpu_layout_initialized == false) {
+    int lib_accessable = numa_available();
+    if (lib_accessable == -1) {
+      throw std::runtime_error("libnuma not accessable");
     }
-    for (size_t j = 0; j < bm->size; j++) {
-      if (numa_bitmask_isbitset(bm, j) != 0) {
-        if (verbose) {
-          std::printf("%zu ", j);
-        }
-        // If core id is not in the excluded list
-        if (start_core <= j && j <= end_core && (std::find(cores_to_exclude.begin(), cores_to_exclude.end(), j) == cores_to_exclude.end())) {
+    int numa_max_cpus = numa_num_configured_cpus();
+    std::printf("System CPU count %d\n", numa_max_cpus);
+
+    bitmask* bm = numa_bitmask_alloc(numa_max_cpus);
+    for (int i = 0; i <= numa_max_node(); ++i) {
+      numa_node_to_cpus(i, bm);
+      if (verbose) {
+        std::printf("NUMA node %d ", i);
+        PrintBitmask(bm);
+        std::printf(" CPUs: ");
+      }
+      for (size_t j = 0; j < bm->size; j++) {
+        if (numa_bitmask_isbitset(bm, j) != 0) {
+          if (verbose) {
+            std::printf("%zu ", j);
+          }
+          // If core id is not in the excluded list
+          if (std::find(cores_to_exclude.begin(), cores_to_exclude.end(), j) ==
+              cores_to_exclude.end()) {
             cpu_layout.emplace_back(j);
+          }
         }
       }
+      if (verbose) {
+        std::printf("\n");
+      }
     }
-    if (verbose) {
-      std::printf("\n");
-    }
+    std::printf("Usable Cpu count %zu\n", cpu_layout.size());
+
+    numa_bitmask_free(bm);
+    cpu_layout_initialized = true;
   }
-  
-  if (verbose) {std::printf("Usable Cpu count %zu\n", cpu_layout.size());}
-
-  numa_bitmask_free(bm);
-  cpu_layout_initialized = true; // Reinitialize cpu layout regardless of this value
-}
-
-void UpdateCpuLayout(const std::vector<size_t>& cores_to_exclude) {
-  cpu_layout.clear();
-  SetCpuLayoutOnNumaNodes(false, cores_to_exclude);
-  // // Find available cpus in this machine
-  // std::ifstream file("/sys/fs/cgroup/cpuset/cpuset.cpus");
-  // std::string s;
-  // std::getline(file, s);
-  // size_t end_core = (size_t) stoi(s.substr(s.find("-") + 1));
-
-  // // Update layout
-  // if (cpu_layout.size() <= end_core) {
-  //   for (size_t j = cpu_layout.size(); j < end_core; j++) {
-  //     std::printf("Added to CPU LAYOUT\n");
-  //     cpu_layout.emplace_back(j);
-  //   }
-  // } else {
-  //   for (size_t j = cpu_layout.size(); j > end_core + 1; j--) {
-  //     std::printf("REmoved from CPU LAYOUT");
-  //     cpu_layout.pop_back();
-  //   }
-  // }
 }
 
 size_t GetPhysicalCoreId(size_t core_id) {
@@ -187,7 +162,6 @@ void PinToCoreWithOffset(ThreadType thread_type, size_t core_offset,
 
     size_t assigned_core = GetCoreId(requested_core);
 
-    std::printf("PinToCoreWithOffset: thread_id: %ld, requested_core: %ld, assigned_core: %ld \n", thread_id, requested_core, assigned_core);
     if (allow_reuse == false) {
       // Check to see if core has already been assigned
       //(faster search is possible here but isn't necessary)
@@ -225,22 +199,6 @@ void PinToCoreWithOffset(ThreadType thread_type, size_t core_offset,
   }
 }
 
-void RemoveCoreFromList(int core_id, int core_offset) {
-  if (core_list.back().requested_core_ == (size_t)(core_id + core_offset)) {
-    core_list.pop_back();
-  }
-} 
-
-size_t GetAvailableCores() {
-  std::ifstream file("/sys/fs/cgroup/cpuset/cpuset.cpus");
-  std::string s;
-  std::getline(file, s);
-
-  size_t start_core = (size_t) stoi(s.substr(0, s.find("-")));
-  size_t end_core = (size_t) stoi(s.substr(s.find("-") + 1));
-  return end_core - start_core; // remove master core, tx/rx core
-}
-
 std::vector<size_t> Utils::StrToChannels(const std::string& channel) {
   std::vector<size_t> channels;
   if (channel == "A") {
@@ -255,21 +213,24 @@ std::vector<size_t> Utils::StrToChannels(const std::string& channel) {
 
 std::vector<std::complex<int16_t>> Utils::DoubleToCint16(
     const std::vector<std::vector<double>>& in) {
-  int len = in[0].size();
+  const int len = in.at(0).size();
+  assert(in.size() == 2 && (in.at(0).size() == in.at(1).size()));
   std::vector<std::complex<int16_t>> out(len, 0);
   for (int i = 0; i < len; i++) {
-    out[i] = std::complex<int16_t>((int16_t)(in[0][i] * 32768),
-                                   (int16_t)(in[1][i] * 32768));
+    out.at(i) = std::complex<int16_t>(
+        static_cast<int16_t>(in.at(0).at(i) * kShrtFltConvFactor),
+        static_cast<int16_t>(in.at(1).at(i) * kShrtFltConvFactor));
   }
   return out;
 }
 
 std::vector<std::complex<float>> Utils::DoubleToCfloat(
     const std::vector<std::vector<double>>& in) {
-  int len = in[0].size();
+  const int len = in.at(0).size();
+  assert(in.size() == 2 && (in.at(0).size() == in.at(1).size()));
   std::vector<std::complex<float>> out(len, 0);
   for (int i = 0; i < len; i++) {
-    out[i] = std::complex<float>(in[0][i], in[1][i]);
+    out.at(i) = std::complex<float>(in.at(0).at(i), in.at(1).at(i));
   }
   return out;
 }
@@ -279,18 +240,17 @@ std::vector<std::complex<float>> Utils::Uint32tocfloat(
   int len = in.size();
   std::vector<std::complex<float>> out(len, 0);
   for (size_t i = 0; i < in.size(); i++) {
-    auto arr_hi_int = static_cast<int16_t>(in[i] >> 16);
-    auto arr_lo_int = static_cast<int16_t>(in[i] & 0x0FFFF);
-
-    float arr_hi = (float)arr_hi_int / 32768.0;
-    float arr_lo = (float)arr_lo_int / 32768.0;
+    const auto arr_hi_int = static_cast<int16_t>(in.at(i) >> 16);
+    const auto arr_lo_int = static_cast<int16_t>(in.at(i) & 0x0FFFF);
+    const float arr_hi = static_cast<float>(arr_hi_int) / kShrtFltConvFactor;
+    const float arr_lo = static_cast<float>(arr_lo_int) / kShrtFltConvFactor;
 
     if (order == "IQ") {
       std::complex<float> csamp(arr_hi, arr_lo);
-      out[i] = csamp;
+      out.at(i) = csamp;
     } else if (order == "QI") {
       std::complex<float> csamp(arr_lo, arr_hi);
-      out[i] = csamp;
+      out.at(i) = csamp;
     }
   }
   return out;
@@ -299,10 +259,11 @@ std::vector<std::complex<float>> Utils::Uint32tocfloat(
 std::vector<std::complex<float>> Utils::Cint16ToCfloat32(
     const std::vector<std::complex<int16_t>>& in) {
   std::vector<std::complex<float>> samps(in.size());
-  std::transform(
-      in.begin(), in.end(), samps.begin(), [](std::complex<int16_t> ci) {
-        return std::complex<float>(ci.real() / 32768.0, ci.imag() / 32768.0);
-      });
+  std::transform(in.begin(), in.end(), samps.begin(),
+                 [](std::complex<int16_t> ci) {
+                   return std::complex<float>(ci.real() / kShrtFltConvFactor,
+                                              ci.imag() / kShrtFltConvFactor);
+                 });
   return samps;
 }
 
@@ -311,12 +272,12 @@ std::vector<uint32_t> Utils::Cint16ToUint32(
     const std::string& order) {
   std::vector<uint32_t> out(in.size(), 0);
   for (size_t i = 0; i < in.size(); i++) {
-    auto re = static_cast<uint16_t>(in[i].real());
-    auto im = static_cast<uint16_t>(conj ? -in[i].imag() : in[i].imag());
+    auto re = static_cast<uint16_t>(in.at(i).real());
+    auto im = static_cast<uint16_t>(conj ? -in.at(i).imag() : in.at(i).imag());
     if (order == "IQ") {
-      out[i] = (uint32_t)re << 16 | im;
+      out.at(i) = (uint32_t)re << 16 | im;
     } else if (order == "QI") {
-      out[i] = (uint32_t)im << 16 | re;
+      out.at(i) = (uint32_t)im << 16 | re;
     }
   }
   return out;
@@ -327,14 +288,14 @@ std::vector<uint32_t> Utils::Cfloat32ToUint32(
     const std::string& order) {
   std::vector<uint32_t> out(in.size(), 0);
   for (size_t i = 0; i < in.size(); i++) {
-    auto re =
-        static_cast<uint16_t>(static_cast<int16_t>(in[i].real() * 32768.0));
-    auto im = static_cast<uint16_t>(
-        static_cast<int16_t>((conj ? -in[i].imag() : in[i].imag()) * 32768));
+    auto re = static_cast<uint16_t>(
+        static_cast<int16_t>(in.at(i).real() * kShrtFltConvFactor));
+    auto im = static_cast<uint16_t>(static_cast<int16_t>(
+        (conj ? -in.at(i).imag() : in.at(i).imag()) * kShrtFltConvFactor));
     if (order == "IQ") {
-      out[i] = (uint32_t)re << 16 | im;
+      out.at(i) = (uint32_t)re << 16 | im;
     } else if (order == "QI") {
-      out[i] = (uint32_t)im << 16 | re;
+      out.at(i) = (uint32_t)im << 16 | re;
     }
   }
   return out;
@@ -392,8 +353,8 @@ void Utils::LoadData(const char* filename,
     if (ret < 0) {
       break;
     }
-    data[i] =
-        std::complex<int16_t>(int16_t(real * 32768), int16_t(imag * 32768));
+    data.at(i) = std::complex<int16_t>(int16_t(real * kShrtFltConvFactor),
+                                       int16_t(imag * kShrtFltConvFactor));
   }
   std::fclose(fp);
 }
@@ -403,7 +364,7 @@ void Utils::LoadData(const char* filename, std::vector<unsigned>& data,
   FILE* fp = std::fopen(filename, "r");
   data.resize(samples);
   for (int i = 0; i < samples; i++) {
-    int ret = fscanf(fp, "%u", &data[i]);
+    int ret = fscanf(fp, "%u", &data.at(i));
     if (ret < 0) {
       break;
     }
@@ -437,7 +398,7 @@ std::vector<std::string> Utils::Split(const std::string& s, char delimiter) {
 }
 
 void Utils::PrintVector(const std::vector<std::complex<int16_t>>& data) {
-  for (auto& i : data) {
+  for (const auto& i : data) {
     std::cout << real(i) << " " << imag(i) << std::endl;
   }
 }

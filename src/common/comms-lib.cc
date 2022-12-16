@@ -24,6 +24,7 @@
 
 #include <utility>
 
+#include "datatype_conversion.h"
 #include "logger.h"
 #include "utils.h"
 
@@ -38,7 +39,7 @@ size_t CommsLib::FindPilotSeq(const std::vector<std::complex<float>>& iq,
   }
 
   // Equivalent to numpy's sign function
-  auto iq_sign = CommsLib::Csign(std::move(iq));
+  auto iq_sign = CommsLib::Csign(iq);
 
   // Convolution
   auto pilot_corr = CommsLib::Convolve(iq_sign, pilot_conj);
@@ -79,7 +80,7 @@ int CommsLib::FindLts(const std::vector<std::complex<double>>& iq, int seqLen) {
   }
 
   // Equivalent to numpy's sign function
-  auto iq_sign = CommsLib::Csign(std::move(iq));
+  auto iq_sign = CommsLib::Csign(iq);
 
   // Convolution
   auto lts_corr = CommsLib::Convolve(iq_sign, lts_sym_conj);
@@ -509,6 +510,39 @@ MKL_LONG CommsLib::FFT(complex_float* in_out, int fftsize) {
   return status;
 }
 
+void CommsLib::FFTShift(complex_float* in, complex_float* tmp, int fftsize) {
+  std::memcpy(tmp, in + fftsize / 2, sizeof(float) * fftsize);
+  std::memcpy(in + fftsize / 2, in, sizeof(float) * fftsize);
+  std::memcpy(in, tmp, sizeof(float) * fftsize);
+}
+
+std::vector<std::complex<float>> CommsLib::FFTShift(
+    const std::vector<std::complex<float>>& in) {
+  const size_t fft_size = in.size();
+  std::vector<std::complex<float>> out(fft_size);
+  std::vector<std::complex<float>> in_freq_shifted;
+  in_freq_shifted.insert(in_freq_shifted.end(), in.begin() + fft_size / 2,
+                         in.end());
+  in_freq_shifted.insert(in_freq_shifted.end(), in.begin(),
+                         in.begin() + fft_size / 2);
+  std::memcpy(out.data(), in_freq_shifted.data(),
+              fft_size * sizeof(std::complex<float>));
+  return out;
+}
+
+std::vector<complex_float> CommsLib::FFTShift(
+    const std::vector<complex_float>& in) {
+  const size_t fft_size = in.size();
+  std::vector<complex_float> out(fft_size);
+  std::vector<complex_float> in_freq_shifted;
+  in_freq_shifted.insert(in_freq_shifted.end(), in.begin() + fft_size / 2,
+                         in.end());
+  in_freq_shifted.insert(in_freq_shifted.end(), in.begin(),
+                         in.begin() + fft_size / 2);
+  std::memcpy(out.data(), in_freq_shifted.data(), fft_size * sizeof(float) * 2);
+  return out;
+}
+
 float CommsLib::ComputeOfdmSnr(const std::vector<std::complex<float>>& data_t,
                                size_t data_start_index,
                                size_t data_stop_index) {
@@ -557,14 +591,9 @@ std::vector<std::complex<float>> CommsLib::ComposePartialPilotSym(
 
 void CommsLib::Ifft2tx(const complex_float* in, std::complex<short>* out,
                        size_t N, size_t prefix, size_t cp, float scale) {
-  for (size_t j = 0; j < N; j++) {
-    out[prefix + cp + j] =
-        std::complex<int16_t>((int16_t)((in[j].re / scale) * 32768),
-                              (int16_t)((in[j].im / scale) * 32768));
-  }
-  for (size_t j = 0; j < cp; j++) {
-    out[prefix + j] = out[prefix + N + j];
-  }
+  ConvertFloatToShort(reinterpret_cast<const float*>(in),
+                      reinterpret_cast<short*>(&out[prefix]), N * 2, cp * 2,
+                      scale);
 }
 
 std::vector<std::complex<float>> CommsLib::Modulate(
@@ -572,7 +601,7 @@ std::vector<std::complex<float>> CommsLib::Modulate(
   std::vector<std::complex<float>> out(in.size());
   if (type == kQpsk) {
     float qpsk_table[2][4];  // = init_qpsk();
-    float scale = 1 / sqrt(2);
+    float scale = 1 / std::sqrt(2);
     float mod_qpsk[2] = {-scale, scale};
     for (int i = 0; i < 4; i++) {
       qpsk_table[0][i] = mod_qpsk[i / 2];
@@ -596,7 +625,7 @@ std::vector<std::complex<float>> CommsLib::Modulate(
       qam16_table[1][i] = mod_16qam[i % 4];
     }
     for (size_t i = 0; i < in.size(); i++) {
-      if (in[i] >= 0 and in[i] < 16) {
+      if (in[i] >= 0 && in[i] < 16) {
         out[i] =
             std::complex<float>(qam16_table[0][in[i]], qam16_table[1][in[i]]);
       } else {
@@ -614,7 +643,7 @@ std::vector<std::complex<float>> CommsLib::Modulate(
       qam64_table[1][i] = mod_64qam[i % 8];
     }
     for (size_t i = 0; i < in.size(); i++) {
-      if (in[i] >= 0 and in[i] < 64) {
+      if (in[i] >= 0 && in[i] < 64) {
         out[i] =
             std::complex<float>(qam64_table[0][in[i]], qam64_table[1][in[i]]);
       } else {

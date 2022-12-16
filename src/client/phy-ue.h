@@ -12,16 +12,19 @@
 #include <thread>
 #include <vector>
 
-#include "buffer.h"
+#include "common_typedef_sdk.h"
 #include "comms-lib.h"
 #include "concurrent_queue_wrapper.h"
 #include "concurrentqueue.h"
 #include "config.h"
 #include "datatype_conversion.h"
 #include "mac_thread_client.h"
+#include "message.h"
 #include "modulation.h"
 #include "packet_txrx.h"
 #include "phy_stats.h"
+#include "recorder_thread.h"
+#include "simd_types.h"
 #include "stats.h"
 #include "ue_worker.h"
 
@@ -179,14 +182,14 @@ class PhyUe {
    * First dimension: OFDM_CA_NUM * kFrameWnd
    * Second dimension: BS_ANT_NUM * UE_NUM
    */
-  std::vector<myVec> csi_buffer_;
+  Table<complex_float> csi_buffer_;
 
   /**
    * Data after equalization
    * First dimension: data_symbol_num_perframe * kFrameWnd
    * Second dimension: OFDM_CA_NUM * UE_NUM
    */
-  std::vector<myVec> equal_buffer_;
+  std::vector<SimdAlignCxFltVector> equal_buffer_;
 
   // Data after demodulation. Each buffer has kMaxModType * number of OFDM
   // data subcarriers
@@ -234,6 +237,6 @@ class PhyUe {
   FrameCounters tomac_counters_;
 
   size_t max_equaled_frame_ = 0;
-  std::array<std::shared_ptr<CsvLog::CsvLogger>, CsvLog::kCsvLogs> csv_loggers_;
+  std::vector<std::unique_ptr<Agora_recorder::RecorderThread>> recorders_;
 };
 #endif  // PHY_UE_H_
